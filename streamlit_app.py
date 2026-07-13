@@ -11,9 +11,13 @@ import uuid
 import os
 import requests
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import firebase_admin
 from firebase_admin import credentials, db as firebase_db
+
+# 系統排行榜與時間判定一律使用台灣時區
+TAIWAN_TZ = ZoneInfo("Asia/Taipei")
 
 # =========================
 # Firebase 初始化
@@ -223,6 +227,10 @@ def validate_questions(qs: list) -> list:
 # =========================
 
 def save_record(name: str, score: int, difficulty: str) -> str:
+    """
+    寫入一筆成績到 Firebase Realtime Database。
+    timestamp 一律使用台灣時區的 ISO 格式（帶 +08:00）。
+    """
     init_firebase()
     record_id = str(uuid.uuid4())
     firebase_db.reference("records_science").push({
@@ -230,38 +238,176 @@ def save_record(name: str, score: int, difficulty: str) -> str:
         "name":       name,
         "score":      score,
         "difficulty": difficulty,
-        "timestamp":  datetime.now().isoformat(),
+        "timestamp":  datetime.now(TAIWAN_TZ).isoformat(),
     })
     load_records_cached.clear()
     return record_id
 
 
-@st.cache_data(ttl=30)
-def load_records_cached() -> list:
+@st.cache_data(ttl=30)   # 榜單快取 30 秒（依難度分別快取）
+def load_records_cached(difficulty: str) -> list:
+    """
+    從 Firebase 讀取指定難度的成績（快取 30 秒）。
+    使用 order_by_child("difficulty").equal_to(difficulty) 讓資料庫端
+    先行過濾，避免每次都把整個 records_science 全部下載回來。
+    需搭配 Firebase Rules 的 ".indexOn": ["difficulty"] 才有索引效能。
+    """
     init_firebase()
-    data = firebase_db.reference("records_science").get()
+    ref  = firebase_db.reference("records_science")
+    data = ref.order_by_child("difficulty").equal_to(difficulty).get()
     if not data:
         return []
     return list(data.values())
+
+# =========================
+# 安全解析：時間 / 分數
+# =========================
+
+def parse_timestamp(ts_str) -> "datetime | None":
+    """
+    將 timestamp 字串安全解析為帶時區的 datetime。
+    - 缺少、非字串、格式錯誤 → 回傳 None（不可用 datetime.min 頂替，
+      否則髒資料會因為「時間最早」而在同分排序中被誤判為第一名）。
+    - 舊資料若沒有時區資訊，視為台灣時間（Asia/Taipei）。
+    - 有時區的資料一律轉換為台灣時區，方便跟日曆區間比較。
+    """
+    if not ts_str or not isinstance(ts_str, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(ts_str)
+    except (ValueError, TypeError):
+        return None
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=TAIWAN_TZ)
+    else:
+        dt = dt.astimezone(TAIWAN_TZ)
+    return dt
+
+
+def parse_score(value) -> "int | None":
+    """
+    將 score 安全轉換為 int。
+    考量舊資料可能是字串、None、bool 或其他損毀型態，
+    無法解析時一律回傳 None，交由呼叫端略過該筆紀錄。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(float(value.strip()))
+        except (ValueError, TypeError):
+            return None
+    return None
+
+# =========================
+# 日曆區間排行榜
+# =========================
+
+def get_calendar_range(period: str, now: "datetime | None" = None) -> "tuple[datetime, datetime]":
+    """
+    回傳指定排行榜期間的開始時間與結束時間（皆含時區，Asia/Taipei）。
+    採用「真正的日曆區間」而非固定天數的滑動視窗，
+    並正確處理大小月與閏年。
+    """
+    if now is None:
+        now = datetime.now(TAIWAN_TZ)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=TAIWAN_TZ)
+    else:
+        now = now.astimezone(TAIWAN_TZ)
+
+    def day_start(d: datetime) -> datetime:
+        return d.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def day_end(d: datetime) -> datetime:
+        return d.replace(hour=23, minute=59, second=59, microsecond=999999)
+
+    if period == "本日":
+        start = day_start(now)
+        end   = day_end(now)
+
+    elif period == "本週":
+        monday = now - timedelta(days=now.weekday())   # 週一為一週開始
+        sunday = monday + timedelta(days=6)
+        start  = day_start(monday)
+        end    = day_end(sunday)
+
+    elif period == "本月":
+        start = day_start(now.replace(day=1))
+        if now.month == 12:
+            next_month_first = now.replace(year=now.year + 1, month=1, day=1)
+        else:
+            next_month_first = now.replace(month=now.month + 1, day=1)
+        end = day_end(next_month_first - timedelta(days=1))
+
+    elif period == "本季":
+        q_start_month = ((now.month - 1) // 3) * 3 + 1     # 1, 4, 7, 10
+        start = day_start(now.replace(month=q_start_month, day=1))
+        q_end_month = q_start_month + 2
+        if q_end_month == 12:
+            next_q_first = now.replace(year=now.year + 1, month=1, day=1)
+        else:
+            next_q_first = now.replace(month=q_end_month + 1, day=1)
+        end = day_end(next_q_first - timedelta(days=1))
+
+    elif period == "本年度":
+        start = day_start(now.replace(month=1, day=1))
+        end   = day_end(now.replace(month=12, day=31))
+
+    else:
+        # 例如「歷史排行」或未知 period：回傳全時間範圍（呼叫端通常不會用到）
+        start = datetime.min.replace(tzinfo=TAIWAN_TZ)
+        end   = datetime.max.replace(tzinfo=TAIWAN_TZ)
+
+    return start, end
 
 # =========================
 # 排行榜過濾
 # =========================
 
 def filter_records(records: list, difficulty: str, period: str) -> list:
-    now    = datetime.now()
-    cutoff = {
-        "本年度": now - timedelta(days=365),
-        "本季":   now - timedelta(days=91),
-        "本月":   now - timedelta(days=30),
-        "本週":   now - timedelta(weeks=1),
-        "本日":   now - timedelta(days=1),
-    }.get(period)
-    result = [r for r in records if r.get("difficulty") == difficulty]
-    if cutoff:
-        result = [r for r in result
-                  if datetime.fromisoformat(r["timestamp"]) >= cutoff]
-    return sorted(result, key=lambda x: (-x.get("score", 0), x.get("timestamp", "")))
+    """
+    依難度與期間過濾成績，並回傳「完整」排序後結果（不截斷），
+    供榮譽榜前 10 名與最終結果頁查詢名次共用。
+
+    - difficulty：資料庫查詢階段雖已依難度篩選，這裡仍保留防禦性檢查。
+    - period："本日"/"本週"/"本月"/"本季"/"本年度" 使用日曆區間；
+              "歷史排行" 不做時間篩選。
+    - 任何 timestamp 或 score 解析失敗的髒資料，一律安全略過。
+    - 同名玩家可重複出現在榜單中，不合併、不只留最高分。
+    """
+    use_time_filter = (period != "歷史排行")
+    if use_time_filter:
+        start, end = get_calendar_range(period)
+
+    result = []
+    for r in records:
+        if r.get("difficulty") != difficulty:
+            continue
+
+        ts = parse_timestamp(r.get("timestamp"))
+        if ts is None:
+            continue
+
+        score = parse_score(r.get("score"))
+        if score is None:
+            continue
+
+        if use_time_filter and not (start <= ts <= end):
+            continue
+
+        record = dict(r)
+        record["score"] = score
+        record["_ts"]   = ts
+        result.append(record)
+
+    result.sort(key=lambda x: (-x["score"], x["_ts"]))
+    return result
 
 # =========================
 # 重置 session
@@ -414,14 +560,18 @@ elif st.session_state.step == "setup":
             st.rerun()
 
     with tab_board:
+        diff_options = list(DIFFICULTY_CONFIG.keys())
+        default_idx  = diff_options.index(st.session_state.difficulty) \
+            if st.session_state.difficulty in diff_options else 0
+        diff_tab = st.selectbox("選擇難度榜", diff_options, index=default_idx, key="board_diff")
+
         with st.spinner("載入榜單..."):
-            records = load_records_cached()
+            records = load_records_cached(diff_tab)
+
         if not records:
             st.info("目前尚無成績記錄，完成第一場測驗後即可上榜！")
         else:
-            diff_tab = st.selectbox("選擇難度榜", list(DIFFICULTY_CONFIG.keys()),
-                                    key="board_diff")
-            periods  = ["本日", "本週", "本月", "本季", "本年度"]
+            periods = ["本日", "本週", "本月", "本季", "本年度", "歷史排行"]
 
             st.markdown("#### 🥇 各時段冠軍")
             cols = st.columns(len(periods))
@@ -434,26 +584,30 @@ elif st.session_state.step == "setup":
                         st.markdown(
                             f"<div class='champ-name'>{champ['name']}</div>"
                             f"<div class='champ-score'>{champ['score']} 分</div>"
-                            f"<div class='champ-date'>{champ['timestamp'][:10]}</div>",
+                            f"<div class='champ-date'>{champ['_ts'].strftime('%Y-%m-%d')}</div>",
                             unsafe_allow_html=True)
                     else:
                         st.markdown("<span style='color:#aaa'>虛位以待</span>",
                                     unsafe_allow_html=True)
 
             st.markdown("---")
-            st.markdown(f"#### 📋 {diff_tab} 前 10 名（本年度）")
-            top10 = filter_records(records, diff_tab, "本年度")[:10]
+            period_sel = st.selectbox("選擇排行榜期間", periods, index=4, key="board_period")
+
+            st.markdown(f"#### 📋 {diff_tab}｜{period_sel} 前 10 名")
+            top10 = filter_records(records, diff_tab, period_sel)[:10]
             if not top10:
-                st.info("尚無記錄")
+                st.info("目前尚無符合條件的成績紀錄。")
             else:
                 medals = ["🥇", "🥈", "🥉"]
                 for i, r in enumerate(top10):
-                    medal = medals[i] if i < 3 else f"**#{i+1}**"
+                    medal    = medals[i] if i < 3 else f"**#{i+1}**"
+                    date_str = r["_ts"].strftime("%Y-%m-%d")
+                    time_str = r["_ts"].strftime("%H:%M:%S")
                     st.markdown(
                         f"{medal} &nbsp; **{r['name']}** &nbsp; "
                         f"<span style='color:#1e88e5;font-weight:700'>{r['score']} 分</span>"
                         f"<span style='color:#aaa;font-size:.82rem'>"
-                        f" ／ {r['difficulty']} ／ {r['timestamp'][:10]}</span>",
+                        f" ／ {r['difficulty']} ／ {date_str} {time_str}</span>",
                         unsafe_allow_html=True)
 
 # =========================
@@ -601,7 +755,7 @@ elif st.session_state.step == "result":
                 unsafe_allow_html=True)
 
     with st.spinner("查詢排名中..."):
-        records   = load_records_cached()
+        records   = load_records_cached(st.session_state.difficulty)
         top_year  = filter_records(records, st.session_state.difficulty, "本年度")
         record_id = st.session_state.get("record_id")
         rank      = next(
