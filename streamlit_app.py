@@ -47,19 +47,52 @@ def init_firebase():
 # 訪客計數器
 # =========================
 
+@st.cache_data(ttl=300)  # 5 分鐘快取，避免每次 rerun 都對 Firebase 做即時讀取
+def _get_visitor_count_cached(site_id: str) -> int:
+    """
+    僅負責「讀取」目前的訪客總數，不會遞增計數。
+    加上 @st.cache_data(ttl=300) 是因為：同一個 session 在計數過一次之後，
+    之後每次 Streamlit rerun（例如切換頁面、答題、倒數計時觸發的 rerun）
+    仍然需要顯示最新的訪客數字，若不加快取，每次 rerun 都會對 Firebase
+    發出一次即時讀取請求，在使用人數多時會拖慢頁面、也會消耗 Firebase
+    的讀取額度。快取 5 分鐘內看到的數字可能略舊，但對「訪客人數」這種
+    展示性質的數字來說可以接受。
+    """
+    ref = firebase_db.reference(f"visitor_counts/{site_id}")
+    try:
+        v = ref.get()
+        return v if v is not None else 0
+    except Exception:
+        return 0
+
 def track_visitor(site_id: str) -> int:
+    """
+    依據網站識別碼 (site_id) 進行獨立計數。
+    使用 Firebase Transaction 確保多人同時操作時數據準確。
+
+    - 計數：用 .transaction() 做原子遞增，確保多人同時觸發時
+      不會互相覆蓋、漏算。
+    - 防止重複計數：用 st.session_state["counted"] 當作旗標，確保
+      同一個瀏覽器 session（同一次造訪）只會被計數一次；即使使用者
+      在這次造訪中重新整理頁面、來回切換頁面觸發多次 rerun，也不會
+      被重複累加，符合「訪客人數」而非「頁面渲染次數」的語意。
+    - 第一次呼叫（尚未計數過）才真的寫入 Firebase；之後同一 session
+      內的呼叫，一律轉呼叫上面有快取的 _get_visitor_count_cached，
+      只讀不寫，避免不必要的資料庫存取。
+    """
     init_firebase()
     ref = firebase_db.reference(f"visitor_counts/{site_id}")
     def increment(current):
         return (current or 0) + 1
     try:
         if "counted" not in st.session_state:
+            # 本次造訪第一次呼叫：真正遞增一次，並標記這個 session 已經計過數
             count = ref.transaction(increment)
             st.session_state["counted"] = True
             return count
         else:
-            v = ref.get()
-            return v if v is not None else 0
+            # 同一 session 內的後續呼叫：只讀取（走快取），不再重複計數
+            return _get_visitor_count_cached(site_id)
     except Exception:
         return 0
 
